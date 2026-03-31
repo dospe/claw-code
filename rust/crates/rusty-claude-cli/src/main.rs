@@ -258,6 +258,8 @@ struct StatusContext {
     loaded_config_files: usize,
     discovered_config_files: usize,
     memory_file_count: usize,
+    project_root: Option<PathBuf>,
+    git_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -334,6 +336,39 @@ fn format_resume_report(session_path: &str, message_count: usize, turns: u32) ->
   Messages         {message_count}
   Turns            {turns}"
     )
+}
+
+fn parse_git_status_metadata(status: Option<&str>) -> (Option<PathBuf>, Option<String>) {
+    let Some(status) = status else {
+        return (None, None);
+    };
+    let branch = status.lines().next().and_then(|line| {
+        line.strip_prefix("## ")
+            .map(|line| {
+                line.split(['.', ' '])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .filter(|value| !value.is_empty())
+    });
+    let project_root = find_git_root().ok();
+    (project_root, branch)
+}
+
+fn find_git_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(env::current_dir()?)
+        .output()?;
+    if !output.status.success() {
+        return Err("not a git repository".into());
+    }
+    let path = String::from_utf8(output.stdout)?.trim().to_string();
+    if path.is_empty() {
+        return Err("empty git root".into());
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn run_resume_command(
@@ -724,13 +759,17 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let (project_root, git_branch) =
+        parse_git_status_metadata(project_context.git_status.as_deref());
     Ok(StatusContext {
         cwd,
         session_path: session_path.map(Path::to_path_buf),
         loaded_config_files: runtime_config.loaded_entries().len(),
         discovered_config_files,
         memory_file_count: project_context.instruction_files.len(),
+        project_root,
+        git_branch,
     })
 }
 
@@ -764,10 +803,17 @@ fn format_status_report(
         format!(
             "Workspace
   Cwd              {}
+  Project root     {}
+  Git branch       {}
   Session          {}
   Config files     loaded {}/{}
   Memory files     {}",
             context.cwd.display(),
+            context
+                .project_root
+                .as_ref()
+                .map_or_else(|| "unknown".to_string(), |path| path.display().to_string()),
+            context.git_branch.as_deref().unwrap_or("unknown"),
             context.session_path.as_ref().map_or_else(
                 || "live-repl".to_string(),
                 |path| path.display().to_string()
@@ -1287,9 +1333,9 @@ mod tests {
     use super::{
         format_cost_report, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_resume_report,
-        format_status_report, normalize_permission_mode, parse_args, render_init_claude_md,
-        render_repl_help, resume_supported_slash_commands, status_context, CliAction, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        format_status_report, normalize_permission_mode, parse_args, parse_git_status_metadata,
+        render_init_claude_md, render_repl_help, resume_supported_slash_commands, status_context,
+        CliAction, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole};
     use std::path::{Path, PathBuf};
@@ -1500,6 +1546,8 @@ mod tests {
                 loaded_config_files: 2,
                 discovered_config_files: 3,
                 memory_file_count: 4,
+                project_root: Some(PathBuf::from("/tmp")),
+                git_branch: Some("main".to_string()),
             },
         );
         assert!(status.contains("Status"));
@@ -1509,6 +1557,8 @@ mod tests {
         assert!(status.contains("Latest total     10"));
         assert!(status.contains("Cumulative total 31"));
         assert!(status.contains("Cwd              /tmp/project"));
+        assert!(status.contains("Project root     /tmp"));
+        assert!(status.contains("Git branch       main"));
         assert!(status.contains("Session          session.json"));
         assert!(status.contains("Config files     loaded 2/3"));
         assert!(status.contains("Memory files     4"));
@@ -1520,6 +1570,16 @@ mod tests {
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
+    }
+
+    #[test]
+    fn parses_git_status_metadata() {
+        let (root, branch) = parse_git_status_metadata(Some(
+            "## rcc/cli...origin/rcc/cli
+ M src/main.rs",
+        ));
+        assert_eq!(branch.as_deref(), Some("rcc/cli"));
+        let _ = root;
     }
 
     #[test]
